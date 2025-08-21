@@ -9,4 +9,11 @@ extern uint32_t enc_val[ENC_GPIO_SIZE];
 
 #include "ws2812b_util.c"
 #include "color_cycle.c"
-#include "turbocharger.c"
+#include "pink.c"
+#include "red.c"
+#include "green.c"
+#include "blue.c"
+#include "cyan.c"
+#include "purple.c"
+#include "yellow.c"
+#include "orange.c"

@@ -18,6 +18,7 @@
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include "tusb.h"
+#include "pico/bootrom.h"
 #include "usb_descriptors.h"
 // clang-format off
 #include "debounce/debounce_include.h"
@@ -28,9 +29,12 @@ PIO pio, pio_1;
 uint32_t enc_val[ENC_GPIO_SIZE];
 uint32_t prev_enc_val[ENC_GPIO_SIZE];
 int cur_enc_val[ENC_GPIO_SIZE];
+int e3wait = 3;
+int e4wait = 6;
+bool but11 = 0;
+bool but12 = 0;
 
-bool sw_prev_raw_val[SW_GPIO_SIZE];
-bool sw_cooked_val[SW_GPIO_SIZE];
+bool prev_sw_val[SW_GPIO_SIZE];
 uint64_t sw_timestamp[SW_GPIO_SIZE];
 
 bool kbm_report;
@@ -39,7 +43,7 @@ uint64_t reactive_timeout_timestamp;
 
 void (*ws2812b_mode)();
 void (*loop_mode)();
-void (*debounce_mode)();
+uint16_t (*debounce_mode)();
 bool joy_mode_check = true;
 
 union {
@@ -75,15 +79,15 @@ void update_lights() {
   for (int i = 0; i < LED_GPIO_SIZE; i++) {
     if (time_us_64() - reactive_timeout_timestamp >= REACTIVE_TIMEOUT_MAX) {
       if (!gpio_get(SW_GPIO[i])) {
-        gpio_put(LED_GPIO[i], 1);
-      } else {
         gpio_put(LED_GPIO[i], 0);
+      } else {
+        gpio_put(LED_GPIO[i], 1);
       }
     } else {
       if (lights_report.lights.buttons[i] == 0) {
-        gpio_put(LED_GPIO[i], 0);
-      } else {
         gpio_put(LED_GPIO[i], 1);
+      } else {
+        gpio_put(LED_GPIO[i], 0);
       }
     }
   }
@@ -99,6 +103,7 @@ struct report {
  * Gamepad Mode
  **/
 void joy_mode() {
+  static int held = 0;
   if (tud_hid_ready()) {
     // find the delta between previous and current enc_val
     for (int i = 0; i < ENC_GPIO_SIZE; i++) {
@@ -111,11 +116,72 @@ void joy_mode() {
     }
 
     report.joy0 = ((double)cur_enc_val[0] / ENC_PULSE) * (UINT8_MAX + 1);
-    report.joy1 = ((double)cur_enc_val[1] / ENC_PULSE) * (UINT8_MAX + 1);
+    report.joy1 = 127;
 
     tud_hid_n_report(0x00, REPORT_ID_JOYSTICK, &report, sizeof(report));
   }
 }
+
+/**
+ * Digital Mode
+ **/
+void digital_mode() {
+  static int joy0_value = 127;      // Track joystick direction
+  static int movement_counter = 0;  // Counter to track how long since last movement
+  const int reset_threshold = 50;  // Number of iterations to wait before resetting
+  const int movement_threshold = 5; // Minimum delta to register movement
+
+  if (tud_hid_ready()) {
+    bool encoder_moving = false;  // Flag to check if any encoder has moved
+
+    // Calculate movement for the encoder and update cur_enc_val
+    for (int i = 0; i < ENC_GPIO_SIZE; i++) {
+      // Calculate delta between the current and previous encoder values
+      int delta = (enc_val[i] - prev_enc_val[i]) * (ENC_REV[i] ? 1 : -1);
+
+      // Only register significant movement based on movement_threshold
+      if (abs(delta) >= movement_threshold) {
+        // Update cur_enc_val to reflect the movement
+        cur_enc_val[i] += delta;
+        while (cur_enc_val[i] < 0) cur_enc_val[i] += ENC_PULSE;
+        cur_enc_val[i] %= ENC_PULSE;
+
+        // Update the previous value for the next iteration
+        prev_enc_val[i] = enc_val[i];
+
+        // Determine joystick direction based on the delta
+        if (delta > 0) {
+          joy0_value = 0;  // Movement forward
+          encoder_moving = true;
+        } else if (delta < 0) {
+          joy0_value = 255;    // Movement backward
+          encoder_moving = true;
+        }
+      }
+    }
+
+    // If encoder is moving, reset the movement counter
+    if (encoder_moving) {
+      movement_counter = 0;
+    } else {
+      // If no movement, increment the counter
+      movement_counter++;
+    }
+
+    // Check if the reset threshold has been reached
+    if (movement_counter >= reset_threshold) {
+      joy0_value = 127;  // Reset to neutral after the threshold is reached
+    }
+
+    // Prepare the joystick report
+    report.joy1 = joy0_value;  // Set joy0 based on movement or neutral
+    report.joy0 = 127;         // Keep joy1 centered
+
+    // Send the joystick report
+    tud_hid_n_report(0x00, REPORT_ID_JOYSTICK, &report, sizeof(report));
+  }
+}
+
 
 /**
  * Keyboard Mode
@@ -147,9 +213,8 @@ void key_mode() {
         delta[i] = (enc_val[i] - prev_enc_val[i]) * (ENC_REV[i] ? 1 : -1);
         prev_enc_val[i] = enc_val[i];
       }
-
-      tud_hid_mouse_report(REPORT_ID_MOUSE, 0x00, delta[0] * MOUSE_SENS,
-                           delta[1] * MOUSE_SENS, 0, 0);
+      tud_hid_mouse_report(REPORT_ID_MOUSE, 0x00, delta[0] * MOUSE_SENS, 0, 0,
+                           0);
     }
     // Alternate reports
     kbm_report = !kbm_report;
@@ -157,16 +222,16 @@ void key_mode() {
 }
 
 /**
- * Updates input states and stores true state into report.buttons.
+ * Update Input States
  * Note: Switches are pull up, negate value
  **/
 void update_inputs() {
-  report.buttons = 0;
-  for (int i = SW_GPIO_SIZE - 1; i >= 0; i--) {
-    sw_prev_raw_val[i] = !gpio_get(SW_GPIO[i]);
-
-    report.buttons <<= 1;
-    report.buttons |= sw_cooked_val[i];
+  for (int i = 0; i < SW_GPIO_SIZE; i++) {
+    // If switch gets pressed, record timestamp
+    if (prev_sw_val[i] == false && !gpio_get(SW_GPIO[i]) == true) {
+      sw_timestamp[i] = time_us_64();
+    }
+    prev_sw_val[i] = !gpio_get(SW_GPIO[i]);
   }
 }
 
@@ -213,7 +278,7 @@ void init() {
 
   // Setup Encoders
   for (int i = 0; i < ENC_GPIO_SIZE; i++) {
-    enc_val[i] = prev_enc_val[i] = cur_enc_val[i] = 0;
+    enc_val[i], prev_enc_val[i], cur_enc_val[i] = 0;
     encoders_program_init(pio, i, offset, ENC_GPIO[i], ENC_DEBOUNCE);
 
     dma_channel_config c = dma_channel_get_default_config(i);
@@ -242,8 +307,7 @@ void init() {
 
   // Setup Button GPIO
   for (int i = 0; i < SW_GPIO_SIZE; i++) {
-    sw_prev_raw_val[i] = false;
-    sw_cooked_val[i] = false;
+    prev_sw_val[i] = false;
     sw_timestamp[i] = 0;
     gpio_init(SW_GPIO[i]);
     gpio_set_function(SW_GPIO[i], GPIO_FUNC_SIO);
@@ -264,6 +328,9 @@ void init() {
   if (!gpio_get(SW_GPIO[0])) {
     loop_mode = &key_mode;
     joy_mode_check = false;
+  } else if (!gpio_get(SW_GPIO[2])){
+    loop_mode = &digital_mode;
+    joy_mode_check = true;
   } else {
     loop_mode = &joy_mode;
     joy_mode_check = true;
@@ -271,9 +338,15 @@ void init() {
 
   // RGB Mode Switching
   if (!gpio_get(SW_GPIO[1])) {
-    ws2812b_mode = &turbocharger_color_cycle;
-  } else {
-    ws2812b_mode = &ws2812b_color_cycle;
+	  ws2812b_mode = &ws2812b_color_cycle;
+  }else {
+    ws2812b_mode = &ws2812b_blue;
+    
+  }
+
+  // Reboot to Bootloader
+  if (!gpio_get(SW_GPIO[8])) {
+	  reset_usb_boot(0,0);
   }
 
   // Debouncing Mode
@@ -295,8 +368,8 @@ int main(void) {
 
   while (1) {
     tud_task();  // tinyusb device task
-    debounce_mode();
     update_inputs();
+    report.buttons = debounce_mode();
     loop_mode();
     update_lights();
   }
